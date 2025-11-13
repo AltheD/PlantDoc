@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "dataset": "PlantDoc",
+    "seed": 42,
+    "created_by": "example",
+    "created_at": "2025-11-13",
+    "note": "此文件为示例，请复制后改名为不带 .example 的正式划分文件。"
+  },
+  "classes": [
+    "apple leaf",
+    "apple rust leaf",
+    "Apple Scab Leaf"
+  ],
+  "splits": {
+    "train": [
+      "raw/PlantDoc/TRAIN/apple leaf/IMG_0001.jpg",
+      "raw/PlantDoc/TRAIN/apple rust leaf/IMG_0002.jpg"
+    ],
+    "val": [
+      "raw/PlantDoc/TRAIN/Apple Scab Leaf/IMG_0003.jpg"
+    ],
+    "test": [
+      "raw/PlantDoc/TEST/apple leaf/IMG_9999.jpg"
+    ]
+  }
+}
+
+
