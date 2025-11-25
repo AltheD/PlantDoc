@@ -215,7 +215,7 @@ def save_predictions(model, dataloader, classes: List[str], device: str, output_
                 )
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["pred_label", "target_label"])
+        writer = csv.DictWriter(f, fieldnames=["image_path", "pred_label", "target_label"])
         writer.writeheader()
         writer.writerows(rows)
 
