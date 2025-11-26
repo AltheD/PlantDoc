@@ -13,9 +13,12 @@ python -m src.training.resnet50_baseline \
 
 import argparse
 import json
+import math
+import random
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -52,6 +55,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pred-csv", type=Path, default=Path("outputs/predictions/resnet50_test_preds.csv"))
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--randaug-num-ops", type=int, default=0)
+    parser.add_argument("--randaug-magnitude", type=int, default=9)
+    parser.add_argument("--mixup-alpha", type=float, default=0.0)
+    parser.add_argument("--cutmix-alpha", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -96,7 +104,7 @@ class PlantDocDataset(Dataset):
         return image, label, raw_rel
 
 
-def build_transforms(augment: str):
+def build_transforms(augment: str, randaug_num_ops: int = 0, randaug_magnitude: int = 9):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     if augment == "none":
         return transforms.Compose(
@@ -111,6 +119,9 @@ def build_transforms(augment: str):
             transforms.RandomRotation(20),
             transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+            transforms.RandAugment(num_ops=randaug_num_ops, magnitude=randaug_magnitude)
+            if randaug_num_ops > 0
+            else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
             normalize,
         ]
@@ -132,7 +143,44 @@ def build_optimizer(params: Iterable, args: argparse.Namespace, lr: float):
     return optim.SGD(params, lr=lr, momentum=momentum, weight_decay=args.weight_decay)
 
 
-def run_epoch(model, dataloader, criterion, optimizer, device) -> Dict[str, float]:
+def rand_bbox(size, lam):
+    _, _, H, W = size
+    cut_rat = math.sqrt(1.0 - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    return bbx1, bby1, bbx2, bby2
+
+
+def apply_mixup_cutmix(images, labels, args):
+    mixup_alpha = args.mixup_alpha
+    cutmix_alpha = args.cutmix_alpha
+    if mixup_alpha <= 0 and cutmix_alpha <= 0:
+        return images, labels, labels, 1.0, False
+
+    use_mixup = mixup_alpha > 0 and (cutmix_alpha <= 0 or random.random() < 0.5)
+    index = torch.randperm(images.size(0), device=images.device)
+
+    if use_mixup:
+        lam = np.random.beta(mixup_alpha, mixup_alpha)
+        images = lam * images + (1 - lam) * images[index]
+        return images, labels, labels[index], lam, True
+
+    lam = np.random.beta(cutmix_alpha, cutmix_alpha)
+    bbx1, bby1, bbx2, bby2 = rand_bbox(images.size(), lam)
+    images[:, :, bby1:bby2, bbx1:bbx2] = images[index, :, bby1:bby2, bbx1:bbx2]
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (images.size(-1) * images.size(-2)))
+    return images, labels, labels[index], lam, True
+
+
+def run_epoch(model, dataloader, criterion, optimizer, device, args) -> Dict[str, float]:
     model.train()
     running_loss = 0.0
     correct = 0
@@ -140,9 +188,13 @@ def run_epoch(model, dataloader, criterion, optimizer, device) -> Dict[str, floa
     for images, labels, _ in dataloader:
         images = images.to(device)
         labels = labels.to(device)
+        images, labels_a, labels_b, lam, mixed = apply_mixup_cutmix(images, labels, args)
         optimizer.zero_grad()
         outputs = model(images)
-        loss = criterion(outputs, labels)
+        if mixed:
+            loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+        else:
+            loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
 
@@ -215,7 +267,7 @@ def save_predictions(model, dataloader, classes: List[str], device: str, output_
                 )
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["pred_label", "target_label"])
+        writer = csv.DictWriter(f, fieldnames=["image_path", "pred_label", "target_label"])
         writer.writeheader()
         writer.writerows(rows)
 
@@ -258,7 +310,7 @@ def main():
 
     device = args.device
     model = create_model(len(classes), device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     log_rows: List[Dict[str, float]] = []
     best_metric = -float("inf")
@@ -272,7 +324,7 @@ def main():
 
         optimizer = build_optimizer(model.fc.parameters(), args, args.lr_head)
         for epoch in range(1, args.freeze_epochs + 1):
-            train_metrics = run_epoch(model, train_loader, criterion, optimizer, device)
+            train_metrics = run_epoch(model, train_loader, criterion, optimizer, device, args)
             val_metrics = evaluate(model, val_loader, criterion, device)
             row = {
                 "phase": "frozen",
@@ -298,7 +350,7 @@ def main():
     patience = 3
     patience_counter = 0
     for epoch in range(1, args.finetune_epochs + 1):
-        train_metrics = run_epoch(model, train_loader, criterion, optimizer, device)
+        train_metrics = run_epoch(model, train_loader, criterion, optimizer, device, args)
         val_metrics = evaluate(model, val_loader, criterion, device)
         scheduler.step()
 
